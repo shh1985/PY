@@ -5,7 +5,6 @@ import sys
 import subprocess
 from pytesser_pro.pytesser_pro import *
 import Image, ImageEnhance, ImageFilter
-from pylab import *
 
 
 
@@ -27,55 +26,44 @@ def binary(image_name, binary_image_name):
 
 # 计算范围内点的个数
 def numpoint(im):
-    w, h = im.size
-    # print w, h
-    data = list(im.getdata())
-    mumpoint = 0
-    for x in range(w):
-        for y in range(h):
-            if data[y*w+x] == 0: # 0-黑色，255-白色
-                mumpoint += 1
-    return mumpoint
+    """Count black pixels - optimized with sum() instead of nested loops"""
+    data = im.getdata()
+    # Count black pixels (value 0) using sum with generator expression
+    return sum(1 for pixel in data if pixel == 0)
 
 # 投影法去干扰线
 def pointmidu(binary_image_name, midu_image_name):
     im = Image.open(binary_image_name)
     w, h = im.size
-    # print w, h
-    len = 5
-    for x in range(0, w, len):
-        box = (x, 0, x+len, h)
+    step = 5
+
+    # Load pixel data once for faster access
+    pixels = im.load()
+
+    # Process in chunks - clear low-density regions
+    for x in range(0, w, step):
+        box = (x, 0, min(x + step, w), h)
         im_box = im.crop(box)
         num = numpoint(im_box)
-        # print num
         if num < 20:
-            for i in range(x, x+len):
+            # Use pixels directly instead of putpixel for better performance
+            for i in range(x, min(x + step, w)):
                 for j in range(h):
-                    im.putpixel((i, j), 255) # 0-黑色，255-白色
+                    pixels[i, j] = 255
+
+    # Calculate column density in a single pass
     data = list(im.getdata())
-    data_column = []
-    for x in range(w):
-        temp = 0
-        for y in range(h):
-            if data[y*w+x] == 0: # 0-黑色，255-白色
-                temp += 1
-        data_column.append(temp)
-    # print data_column
-    start = 0
-    for i in range(0, w, 1):
-        if data_column[i] != 0:
-            break
-        else:
-            start += 1
-    # print start
-    end = w-1
-    for j in range(w-1, -1, -1):
-        if data_column[j] != 0:
-            break
-        else:
-            end += -1
-    # print end
-    box_new = (start, 0, end+1, h)
+    data_column = [
+        sum(1 for y in range(h) if data[y * w + x] == 0)
+        for x in range(w)
+    ]
+
+    # Find content boundaries
+    start = next((i for i, val in enumerate(data_column) if val != 0), 0)
+    end = next((i for i in range(w - 1, -1, -1) if data_column[i] != 0), w - 1)
+
+    # Crop and save
+    box_new = (start, 0, end + 1, h)
     im_box_new = im.crop(box_new)
     im_box_new.save(midu_image_name)
 
@@ -106,30 +94,27 @@ def seg(midu_image_name_pro1, midu_image_name_pro2, num):
     im.save(midu_image_name_pro2)
 
 def get_aim1_point(im):
-    aim = []
+    """Find first black pixel from top in each column"""
     w, h = im.size
-    # print w, h
     data = list(im.getdata())
-    for x in range(0, w, 1):
-        for y in range(0, h, 1):
-            if data[y*w+x] == 0: # 0-黑色，255-白色
-                start_point = (x, y)
-                # print start_point
-                aim.append(start_point)
+    aim = []
+    for x in range(w):
+        for y in range(h):
+            if data[y * w + x] == 0:
+                aim.append((x, y))
                 break
     return aim
 
+
 def get_aim2_point(im):
-    aim = []
+    """Find first black pixel from bottom in each column"""
     w, h = im.size
-    # print w, h
     data = list(im.getdata())
-    for x in range(0, w, 1):
-        for y in range(h-1, -1, -1):
-            if data[y*w+x] == 0: # 0-黑色，255-白色
-                start_point = (x, y)
-                # print start_point
-                aim.append(start_point)
+    aim = []
+    for x in range(w):
+        for y in range(h - 1, -1, -1):
+            if data[y * w + x] == 0:
+                aim.append((x, y))
                 break
     return aim
 

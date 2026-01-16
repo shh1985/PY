@@ -9,6 +9,11 @@ import pymongo
 import datetime
 import multiprocessing as mp
 
+# Pre-compile regex pattern for better performance
+CONTENT_PATTERN = re.compile(r'"type":"(.*?)","codeType".*?"contentHtml":"(.*?)","data".*?"categorySet":"(.*?)","hasMore"')
+
+# Use a requests session for connection pooling
+session = requests.Session()
 
 Category_Map = {
     "1":u"外汇",
@@ -27,10 +32,10 @@ Category_Map = {
     "17":u"其他地区"
 }
 def num2name(category_num):
-    if Category_Map.has_key(category_num):
-        return Category_Map[category_num]
-    else:
-        return ""
+    return Category_Map.get(category_num, "")
+
+# Connection pool for MongoDB - reuse connections across processes
+_mongo_connections = {}
 
 class MongoDBIO:
     # 申明相关的属性
@@ -44,38 +49,38 @@ class MongoDBIO:
 
     # 连接数据库，db和posts为数据库和集合的游标
     def Connection(self):
-        # connection = pymongo.Connection() # 连接本地数据库
-        connection = pymongo.Connection(host=self.host, port=self.port)
-        # db = connection.datas
+        # Use connection pooling - cache connections by host:port:database
+        conn_key = (self.host, self.port, self.database)
+        if conn_key not in _mongo_connections:
+            # Use MongoClient instead of deprecated Connection
+            _mongo_connections[conn_key] = pymongo.MongoClient(host=self.host, port=self.port)
+        connection = _mongo_connections[conn_key]
         db = connection[self.database]
         if self.name or self.password:
-            db.authenticate(name=self.name, password=self.password) # 验证用户名密码
-        # print "Database:", db.name
-        # posts = db.cn_live_news
+            db.authenticate(name=self.name, password=self.password)
         posts = db[self.collection]
-        # print "Collection:", posts.name
         return posts
 
-# 保存操作
-# def ResultSave(save_host, save_port, save_name, save_password, save_database, save_collection, save_contents):
-#     posts = MongoDBIO(save_host, save_port, save_name, save_password, save_database, save_collection).Connection()
-#     for save_content in save_contents:
-#         posts.save(save_content)
 def ResultSave(save_host, save_port, save_name, save_password, save_database, save_collection, save_content):
     posts = MongoDBIO(save_host, save_port, save_name, save_password, save_database, save_collection).Connection()
     posts.save(save_content)
 
+def ResultSaveBatch(save_host, save_port, save_name, save_password, save_database, save_collection, save_contents):
+    """Batch insert for better performance"""
+    if not save_contents:
+        return
+    posts = MongoDBIO(save_host, save_port, save_name, save_password, save_database, save_collection).Connection()
+    posts.insert_many(save_contents)
+
 def Spider(url, data):
-    # # 方法1：requests get
-    content = requests.get(url=url, params=data).content # GET请求发送
-    # # 方法2：urllib2 get
-    # data = urllib.urlencode(data) # 编码工作，由dict转为string
-    # full_url = url+'?'+data
-    # print full_url
-    # content = urllib2.urlopen(full_url).read() # GET请求发送
-    # # content = requests.get(full_url).content # GET请求发送
-    # print type(content) # str
+    # Use session for connection pooling (HTTP keep-alive)
+    content = session.get(url=url, params=data).content
     return content
+
+# Pre-define category sets for faster lookup
+DISTRICT_CATEGORIES = frozenset([u"中国", u"美国", u"欧元区", u"日本", u"英国", u"澳洲", u"加拿大", u"瑞士", u"其他地区"])
+PROPERTY_CATEGORIES = frozenset([u"外汇", u"股市", u"商品", u"债市"])
+CENTRALBANK_CATEGORIES = frozenset([u"央行"])
 
 def ContentSave(item):
     # 保存配置
@@ -89,19 +94,17 @@ def ContentSave(item):
     source = "wallstreetcn"
     createdtime = datetime.datetime.now()
     type = item[0]
-    content = item[1].decode("unicode_escape") # json格式数据中，需从'\\uxxxx'形式的unicode_escape编码转换成u'\uxxxx'的unicode编码
-    content = content.encode("utf-8")
-    # print content
-    # district的筛选
+    content = item[1].decode("unicode_escape").encode("utf-8")
+
+    # district的筛选 - use pre-defined frozensets for faster intersection
     categorySet = item[2]
     category_num = categorySet.split(",")
-    category_name = map(num2name, category_num)
-    districtset = set(category_name)&{u"中国", u"美国", u"欧元区", u"日本", u"英国", u"澳洲", u"加拿大", u"瑞士", u"其他地区"}
-    district = ",".join(districtset)
-    propertyset = set(category_name)&{u"外汇", u"股市", u"商品", u"债市"}
-    property = ",".join(propertyset)
-    centralbankset = set(category_name)&{u"央行"}
-    centralbank = ",".join(centralbankset)
+    category_name = set(map(num2name, category_num))
+
+    district = ",".join(category_name & DISTRICT_CATEGORIES)
+    property = ",".join(category_name & PROPERTY_CATEGORIES)
+    centralbank = ",".join(category_name & CENTRALBANK_CATEGORIES)
+
     save_content = {
         "source":source,
         "createdtime":createdtime,
@@ -115,18 +118,16 @@ def ContentSave(item):
 
 def func(page):
     url = "http://api.wallstreetcn.com/v2/livenews"
-    # get参数
-    data = {
-        "page":page
-    }
+    data = {"page": page}
     content = Spider(url, data)
-    items = re.findall(r'"type":"(.*?)","codeType".*?"contentHtml":"(.*?)","data".*?"categorySet":"(.*?)","hasMore"', content) # 正则匹配
+    # Use pre-compiled regex pattern
+    items = CONTENT_PATTERN.findall(content)
     if len(items) == 0:
         print "The End Page:", page
-        data = urllib.urlencode(data) # 编码工作，由dict转为string
-        full_url = url+'?'+data
+        data = urllib.urlencode(data)
+        full_url = url + '?' + data
         print full_url
-        sys.exit(0) # 无错误退出
+        sys.exit(0)
     else:
         print "The Page:", page, "Downloading..."
         for item in items:
@@ -140,30 +141,26 @@ if __name__ == '__main__':
     start_page = 1
     end_page = 3300
 
-
-    # 多进程抓取
-    pages = [i for i in range(start_page, end_page)]
-    p = mp.Pool()
+    # 多进程抓取 - use optimal number of workers based on CPU cores
+    pages = range(start_page, end_page)  # Use range directly instead of list comprehension
+    p = mp.Pool(processes=mp.cpu_count())  # Explicitly set pool size
     p.map_async(func, pages)
     p.close()
     p.join()
 
-
     # 单进程抓取
+    url = "http://api.wallstreetcn.com/v2/livenews"
     page = end_page
 
-    while 1:
-        url = "http://api.wallstreetcn.com/v2/livenews"
-        # get参数
-        data = {
-            "page":page
-        }
+    while True:
+        data = {"page": page}
         content = Spider(url, data)
-        items = re.findall(r'"type":"(.*?)","codeType".*?"contentHtml":"(.*?)","data".*?"categorySet":"(.*?)","hasMore"', content) # 正则匹配
+        # Use pre-compiled regex pattern
+        items = CONTENT_PATTERN.findall(content)
         if len(items) == 0:
             print "The End Page:", page
-            data = urllib.urlencode(data) # 编码工作，由dict转为string
-            full_url = url+'?'+data
+            data = urllib.urlencode(data)
+            full_url = url + '?' + data
             print full_url
             break
         else:
@@ -173,4 +170,4 @@ if __name__ == '__main__':
             page += 1
 
     end = datetime.datetime.now()
-    print "last time: ", end-start
+    print "last time: ", end - start
